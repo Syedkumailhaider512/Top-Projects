@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Subterra Dataset Generator (Earth-Realistic, Event-Aware, Smooth 15-min Series)
+
+What it does
+------------
+- Asks for start/end date (YYYY-MM-DD)
+- Auto-selects a set of diverse global "sites" with climate archetypes
+- Simulates 15-minute series for:
+    * Surface weather driver (temp, RH, pressure, wind, precip, cloud, radiation)
+    * Underground microclimate (temp, humidity, gases, radon, drip, soil moisture) with
+      physical damping + response lags to surface forcing
+- Plans events: storms, heatwaves, cold snaps, ventilation shifts; applies effects gradually
+- Ensures smoothness: AR(1) + low-pass (moving average) + step rate-limits
+- Generates tables: sites, weather_15min, microclimate_15min, water_chem_daily,
+                    rock_geochem, biology, events, data_dictionary
+- Exports Excel workbook + CSV pack + README
+
+Author: Nova (ChatGPT) for Kumail / AI Cadmey
+License for generated data: CC-BY-4.0
+"""
+
+import os
+import math
+import random
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+# -----------------------------
+# Config (you can tweak defaults)
+# -----------------------------
+OUTPUT_DIR = os.path.join(os.getcwd(), "output_subterra")
+EXCEL_PATH = os.path.join(OUTPUT_DIR, "subterra_full_dataset.xlsx")
+CSV_DIR = os.path.join(OUTPUT_DIR, "csv_pack")
+ZIP_PATH = os.path.join(OUTPUT_DIR, "subterra_csv_pack.zip")
+
+RANDOM_SEED = 20251016
+TIME_STEP_MIN = 15  # 15-minute resolution
+DEFAULT_NUM_SITES = 6  # auto-chosen diverse climates
+
+# Smoothness constraints: max change per step (per 15 min) to avoid jumps
+RATE_LIMITS = {
+    "t2m_C": 0.6,            # °C / 15 min
+    "rh_%": 6.0,             # % / 15 min
+    "mslp_hPa": 1.8,         # hPa / 15 min
+    "wind_m_s": 2.5,         # m/s / 15 min (gust fronts are still limited)
+    "precip_mm": 3.0,        # mm / 15 min (intensity rate-limited)
+    "cloud_frac": 0.25,      # fraction / 15 min
+    "co2_ppm": 200.0,        # ppm / 15 min underground
+    "radon_Bq_m3": 250.0,    # Bq/m³ / 15 min underground
+    "air_T_cave_C": 0.4,     # cave temp
+}
+
+# -----------------------------
+# Logging helper (prints immediately)
+# -----------------------------
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def ar1(prev, phi, sigma, mu=0.0, rnd=np.random):
+    return mu + phi*(prev - mu) + rnd.normal(0, sigma)
+
+def moving_average(arr: np.ndarray, k: int) -> np.ndarray:
+    """Centered moving average with reflection padding."""
+    if k <= 1:
+        return arr
+    pad = k // 2
+    padded = np.pad(arr, pad_width=pad, mode="reflect")
+    kernel = np.ones(k) / k
+    return np.convolve(padded, kernel, mode="valid")
+
+def rate_limit_series(arr: np.ndarray, max_step: float) -> np.ndarray:
+    out = arr.copy()
+    for i in range(1, len(out)):
+        delta = out[i] - out[i-1]
+        if delta > max_step:
+            out[i] = out[i-1] + max_step
+        elif delta < -max_step:
+            out[i] = out[i-1] - max_step
+    return out
+
+def day_of_year(dt: date) -> int:
+    return dt.timetuple().tm_yday
+
+def solar_declination(doy: int) -> float:
+    gamma = 2.0 * math.pi * (doy - 1) / 365.0
+    return (0.006918 - 0.399912*math.cos(gamma) + 0.070257*math.sin(gamma)
+            - 0.006758*math.cos(2*gamma) + 0.000907*math.sin(2*gamma)
+            - 0.002697*math.cos(3*gamma) + 0.00148*math.sin(3*gamma))
+
+def daylength_hours(lat_deg: float, decl: float) -> float:
+    lat = math.radians(lat_deg)
+    cosH = -math.tan(lat)*math.tan(decl)
+    cosH = clamp(cosH, -1.0, 1.0)
+    H = math.acos(cosH)
+    return 2.0 * H * 24.0 / (2.0 * math.pi)
+
+def extraterrestrial_rad_MJ(doy: int, lat_deg: float) -> float:
+    # Daily extraterrestrial radiation (MJ/m2/day)
+    lat = math.radians(lat_deg)
+    dr = 1.0 + 0.033 * math.cos(2*math.pi * doy / 365.0)
+    decl = solar_declination(doy)
+    ws = math.acos(clamp(-math.tan(lat)*math.tan(decl), -1, 1))
+    Gsc = 0.0820  # MJ m-2 min-1
+    Ra = (24*60/ math.pi) * Gsc * dr * (ws*math.sin(lat)*math.sin(decl) +
+                                         math.cos(lat)*math.cos(decl)*math.sin(ws))
+    return max(0.0, Ra)
+
+def prompts_dates() -> Tuple[datetime, datetime]:
+    s = input("Enter start date (YYYY-MM-DD): ").strip()
+    e = input("Enter end date (YYYY-MM-DD): ").strip()
+    start = datetime.strptime(s, "%Y-%m-%d")
+    end = datetime.strptime(e, "%Y-%m-%d")
+    if end < start:
+        raise ValueError("End date must be >= start date.")
+    return start, end
+
+# -----------------------------
+# Site archetypes
+# -----------------------------
+@dataclass
+class SiteArchetype:
+    name: str
+    lat: float
+    lon: float
+    elevation_m: float
+    koppen: str
+    annual_T_mean: float
+    seasonal_amp: float
+    annual_precip_mm: float
+    sea_influence: float  # reduces synoptic variance
+
+ARCHETYPES = [
+    SiteArchetype("London, UK",       51.5,  -0.1,   35,  "Cfb", 10.5,  6.0,  650, 0.7),
+    SiteArchetype("Manaus, Brazil",   -3.1, -60.0,   92,  "Af",  27.0,  1.5, 2300, 0.9),
+    SiteArchetype("Cairo, Egypt",     30.0,  31.2,   75,  "BWh", 22.0, 10.0,   25, 0.2),
+    SiteArchetype("New Delhi, India", 28.6,  77.2,  216,  "Cwa", 25.0, 11.0,  800, 0.3),
+    SiteArchetype("Denver, USA",      39.7,-105.0, 1609,  "BSk", 10.5, 12.0,  350, 0.1),
+    SiteArchetype("Yakutsk, Russia",  62.0, 129.7,  100,  "Dfd",-10.0, 25.0,  230, 0.1),
+    SiteArchetype("Ushuaia, AR",     -54.8, -68.3,   20,  "ET",   5.0,  4.0,  600, 0.8),
+    SiteArchetype("Reykjavík, IS",    64.1, -21.9,   60,  "Cfc",  5.5,  5.0,  840, 0.9),
+]
+
+def auto_pick_sites(n=DEFAULT_NUM_SITES, rnd=random.Random()) -> List[SiteArchetype]:
+    pool = ARCHETYPES.copy()
+    rnd.shuffle(pool)
+    return pool[:n]
+
+# -----------------------------
+# Event planner
+# -----------------------------
+@dataclass
+class Event:
+    site_id: str
+    event_type: str        # "storm", "heatwave", "cold_snap", "vent_shift"
+    start: datetime
+    end: datetime
+    intensity: float       # 0..1 scale
+
+def plan_events(site_id: str, start: datetime, end: datetime, climate: str,
+                rnd=random.Random()) -> List[Event]:
+    """Plan a few events per site depending on climate and season length."""
+    days = (end - start).days + 1
+    n = max(1, days // 30)  # ~1 event per month
+    events = []
+
+    for _ in range(n):
+        etype = rnd.choices(
+            population=["storm", "heatwave", "cold_snap", "vent_shift"],
+            weights=[0.45, 0.25, 0.15, 0.15] if climate not in ["ET","Dfd"] else [0.35, 0.15, 0.35, 0.15],
+            k=1
+        )[0]
+        # duration
+        if etype == "storm":
+            dur_h = rnd.randint(6, 48)
+        elif etype == "heatwave":
+            dur_h = rnd.randint(48, 120)
+        elif etype == "cold_snap":
+            dur_h = rnd.randint(24, 96)
+        else:  # vent_shift
+            dur_h = rnd.randint(12, 72)
+
+        start_offset_h = rnd.randint(0, max(1, (days*24 - dur_h)))
+        st = start + timedelta(hours=start_offset_h)
+        en = st + timedelta(hours=dur_h)
+        if en > end:
+            en = end
+
+        intensity = clamp(rnd.uniform(0.3, 1.0), 0.3, 1.0)
+        events.append(Event(site_id, etype, st, en, intensity))
+
+    return events
+
+# -----------------------------
+# Weather generator (15-min)
+# -----------------------------
+def generate_weather_series(arch: SiteArchetype, start: datetime, end: datetime,
+                            events: List[Event], rnd=np.random) -> pd.DataFrame:
+    # timeline
+    step = timedelta(minutes=TIME_STEP_MIN)
+    times = []
+    cur = start
+    while cur <= end + timedelta(hours=23, minutes=45):
+        times.append(cur)
+        cur += step
+
+    n = len(times)
+    doy = np.array([day_of_year(t.date()) for t in times])
+    decl = np.array([solar_declination(int(d)) for d in doy])
+    day_len = np.array([daylength_hours(arch.lat, d) for d in decl])
+    Ra = np.array([extraterrestrial_rad_MJ(int(d), arch.lat) for d in doy])
+
+    # Annual temp cycle (daily mean)
+    phase_shift = 205 if arch.lat >= 0 else 20
+    seasonal = arch.seasonal_amp * np.cos(2*np.pi*(doy - phase_shift)/365.0)
+    tmean_daily = arch.annual_T_mean + seasonal
+
+    # Up-sample to 15-min using a diurnal shape (sine peaking mid-afternoon)
+    frac_day = np.array([(t.hour*60 + t.minute)/1440.0 for t in times])
+    diurnal_amp = 4.0 + 0.05*abs(arch.lat)
+    diurnal = diurnal_amp * np.sin(2*np.pi*(frac_day - 0.3))  # max ~ 15:00 local
+
+    # Synoptic noise AR(1) on 15-min steps (variance moderated by sea influence)
+    phi_T = 0.98
+    sigma_T = 0.08 + (1 - arch.sea_influence)*0.12
+    tnoise = np.zeros(n)
+    for i in range(1, n):
+        tnoise[i] = ar1(tnoise[i-1], phi_T, sigma_T, 0.0, rnd)
+
+    t2m = tmean_daily + diurnal + tnoise
+
+    # Pressure baseline via elevation + synoptic noise
+    P0 = 1013.25
+    g = 9.80665
+    R = 287.05
+    T_k = 273.15 + (arch.annual_T_mean if arch.annual_T_mean> -40 else -10)
+    p_base = P0 * math.exp(-g * arch.elevation_m / (R * T_k))
+    phi_P = 0.995
+    sigma_P = 0.12 + (1 - arch.sea_influence)*0.20
+    pnoise = np.zeros(n)
+    for i in range(1, n):
+        pnoise[i] = ar1(pnoise[i-1], phi_P, sigma_P, 0.0, rnd)
+    mslp = p_base + pnoise
+    mslp = moving_average(mslp, 5)
+    mslp = rate_limit_series(mslp, RATE_LIMITS["mslp_hPa"])
+
+    # Cloud fraction baseline
+    cloud = np.clip(np.random.normal(0.5, 0.2, n), 0, 1)
+    cloud = moving_average(cloud, 7)
+    cloud = rate_limit_series(cloud, RATE_LIMITS["cloud_frac"])
+
+    # Radiation: clear-sky tau and cloud attenuation (heuristic)
+    tau_cs = 0.70
+    cloud_factor = np.clip(1 - 0.75*cloud, 0, 1)
+    daylight = (np.cos(2*np.pi*(frac_day - 0.25)) + 1)/2
+    daylight = np.where(daylight<0, 0, daylight)
+
+    rad = np.zeros(n)
+    idx0 = 0
+    while idx0 < n:
+        idx1 = min(n, idx0 + int(24*60/TIME_STEP_MIN))  # one day chunk
+        dsl = daylight[idx0:idx1]
+        if dsl.sum() > 0:
+            base = Ra[idx0] * tau_cs * (dsl / dsl.sum())
+        else:
+            base = np.zeros_like(dsl)
+        rad[idx0:idx1] = base
+        idx0 = idx1
+    rad = rad * cloud_factor
+
+    # Precipitation generation
+    def month_weight(mm, koppen):
+        if koppen == "Cwa":
+            weights = [0.03,0.03,0.04,0.05,0.06,0.08,0.15,0.18,0.14,0.11,0.08,0.05]
+        elif koppen == "Af":
+            weights = [0.09,0.09,0.09,0.09,0.09,0.08,0.08,0.08,0.08,0.08,0.08,0.07]
+        elif koppen in ["BWh","BSk"]:
+            weights = [0.03,0.03,0.03,0.05,0.07,0.10,0.14,0.14,0.12,0.10,0.08,0.11]
+        else:
+            weights = [0.07,0.07,0.07,0.08,0.08,0.09,0.11,0.13,0.12,0.09,0.06,0.03]
+        return weights[mm-1]
+
+    precip = np.zeros(n)
+    wet_prev = False
+    if arch.koppen == "Af":
+        pw_w, pd_w, k, theta = 0.65, 0.45, 1.5, 10.0
+    elif arch.koppen == "Cwa":
+        pw_w, pd_w, k, theta = 0.60, 0.20, 1.2, 9.0
+    elif arch.koppen in ["BWh","BSk"]:
+        pw_w, pd_w, k, theta = 0.30, 0.06, 1.0, 6.0
+    else:
+        pw_w, pd_w, k, theta = 0.55, 0.30, 1.2, 7.0
+
+    daily_target_by_month = {}
+    for mm in range(1,13):
+        daily_target_by_month[mm] = (arch.annual_precip_mm * month_weight(mm, arch.koppen)) / 30.0
+
+    i = 0
+    while i < n:
+        this = times[i]
+        mm = this.month
+        factor = (0.7 + 0.6 * (daily_target_by_month[mm] / (arch.annual_precip_mm/365.0 + 1e-6)))
+        p_wet = pw_w if wet_prev else pd_w
+        p_wet = clamp(p_wet * factor, 0.02, 0.98)
+        is_wet = np.random.rand() < p_wet
+        block = min(4, n - i)  # 1 hour block
+        total_mm = 0.0
+        if is_wet:
+            total_mm = np.random.gamma(k, theta) * (0.7 + 0.6*factor)
+            if np.random.rand() < 0.02:
+                total_mm *= np.random.uniform(1.5, 2.5)
+        if total_mm <= 0.05:
+            wet_prev = False
+            i += block
+            continue
+        shape = np.array([0.6, 0.9, 1.0, 0.7])[:block]
+        shape = shape / shape.sum()
+        chunk = total_mm * shape
+        for j in range(block):
+            idx = i + j
+            if idx >= n: break
+            precip[idx] += chunk[j]
+        wet_prev = True
+        i += block
+
+    # Apply storm events (gradual): increase precip, wind, clouds
+    winds = np.clip(np.random.weibull(1.9, n)*6.0*(0.8+0.4*(1-arch.sea_influence)), 0.0, 35.0)
+    gusts = winds*np.random.uniform(1.3, 1.8, n)
+    for ev in events:
+        if ev.event_type != "storm": continue
+        mask = (np.array(times) >= ev.start) & (np.array(times) <= ev.end)
+        if not mask.any(): continue
+        idx = np.where(mask)[0]
+        ramp = np.sin(np.linspace(0, math.pi, len(idx)))
+        boost = ev.intensity * (0.8 + 0.6*np.random.rand())
+        precip[idx] += boost * 3.0 * ramp  # mm spread
+        cloud[idx] = np.clip(cloud[idx] + 0.5*boost*ramp, 0, 1)
+        winds[idx] *= (1.0 + 0.5*boost*ramp)
+        gusts[idx] *= (1.0 + 0.6*boost*ramp)
+        t2m[idx] -= 0.8*boost*ramp  # cooling
+
+    # Heatwave / cold snap adjust t2m & RH gradually
+    rh = np.clip(np.random.normal(65, 15, n), 5, 100)
+    for ev in events:
+        mask = (np.array(times) >= ev.start) & (np.array(times) <= ev.end)
+        if not mask.any(): continue
+        idx = np.where(mask)[0]
+        ramp = np.sin(np.linspace(0, math.pi, len(idx)))
+        if ev.event_type == "heatwave":
+            t2m[idx] += (2.0 + 5.0*ev.intensity)*ramp
+            rh[idx] -= (5.0 + 10.0*ev.intensity)*ramp
+            mslp[idx] -= (0.3 + 0.5*ev.intensity)*ramp
+            cloud[idx] = np.clip(cloud[idx] - 0.2*ev.intensity*ramp, 0, 1)
+        elif ev.event_type == "cold_snap":
+            t2m[idx] -= (2.0 + 4.0*ev.intensity)*ramp
+            rh[idx] += (5.0 + 10.0*ev.intensity)*ramp
+            mslp[idx] += (0.3 + 0.5*ev.intensity)*ramp
+            cloud[idx] = np.clip(cloud[idx] + 0.2*ev.intensity*ramp, 0, 1)
+
+    # Smooth + rate-limit
+    t2m = moving_average(t2m, 5)
+    t2m = rate_limit_series(t2m, RATE_LIMITS["t2m_C"])
+    rh = moving_average(rh, 5)
+    rh = rate_limit_series(rh, RATE_LIMITS["rh_%"])
+    winds = moving_average(winds, 3)
+    winds = rate_limit_series(winds, RATE_LIMITS["wind_m_s"])
+    gusts = np.maximum(gusts, winds*1.1)
+
+    precip = rate_limit_series(precip, RATE_LIMITS["precip_mm"])
+    cloud = rate_limit_series(cloud, RATE_LIMITS["cloud_frac"])
+
+    df = pd.DataFrame({
+        "datetime": times,
+        "t2m_C": np.round(t2m, 2),
+        "rh_%": np.round(rh, 1),
+        "mslp_hPa": np.round(mslp, 1),
+        "wind_m_s": np.round(winds, 2),
+        "wind_gust_m_s": np.round(gusts, 2),
+        "precip_mm": np.round(precip, 2),
+        "cloud_frac": np.round(cloud, 2),
+        "rad_MJ_m2": np.round(rad, 2),
+        "daylength_h": np.round(day_len, 2),
+    })
+    return df
+
+# -----------------------------
+# Cave microclimate from weather (15-min)
+# -----------------------------
+def generate_cave_series(weather: pd.DataFrame, arch: SiteArchetype,
+                         events: List[Event], depth_m: float,
+                         rnd=np.random) -> pd.DataFrame:
+    n = len(weather)
+
+    # Cave temperature: damped + lagged response to surface temp
+    geo_grad = 0.002  # ~2°C per km
+    base = arch.annual_T_mean + geo_grad*depth_m
+    surf_t = weather["t2m_C"].values
+    cave_t = moving_average(surf_t, 13)  # ~3h smoothing
+    cave_t = base + 0.35*(cave_t - arch.annual_T_mean)
+    # Apply event ventilation shifts to temp & RH (gradual)
+    rh = np.clip(80 + np.random.normal(15, 5, n), 50, 100)
+    for ev in events:
+        mask = (weather["datetime"] >= ev.start) & (weather["datetime"] <= ev.end)
+        if not mask.any(): continue
+        idx = np.where(mask.values)[0]
+        ramp = np.sin(np.linspace(0, math.pi, len(idx)))
+        if ev.event_type == "vent_shift":
+            cave_t[idx] += (0.4 + 0.8*ev.intensity)*ramp*np.sign(np.random.randn())
+            rh[idx] += (3.0 + 8.0*ev.intensity)*ramp*np.sign(np.random.randn())
+
+    cave_t = rate_limit_series(cave_t, RATE_LIMITS["air_T_cave_C"])
+    rh = moving_average(rh, 5)
+    rh = rate_limit_series(rh, RATE_LIMITS["rh_%"])
+
+    wind = weather["wind_m_s"].values
+    mslp = weather["mslp_hPa"].values
+    co2 = 1200 + 600*np.exp(-0.2*wind) + 0.8*(1018 - mslp)
+    co2 += np.random.normal(0, 80, n)
+    co2 = moving_average(co2, 9)
+    radon = 900 + 500*np.exp(-0.25*wind) + 0.6*(1018 - mslp) + np.random.normal(0, 60, n)
+    radon = moving_average(radon, 9)
+
+    co2 = rate_limit_series(co2, RATE_LIMITS["co2_ppm"])
+    radon = rate_limit_series(radon, RATE_LIMITS["radon_Bq_m3"])
+
+    o2 = 20.9 - (co2 - 400)/8000.0
+    o2 = np.clip(o2, 18.0, 20.9)
+    ch4 = np.clip(np.random.lognormal(mean=-1.9, sigma=0.5, size=n), 0.3, 12.0)
+    h2 = np.clip(np.random.lognormal(mean=-2.2, sigma=0.6, size=n), 0.05, 6.0)
+    h2s = np.clip(np.random.lognormal(mean=-3.0, sigma=0.6, size=n), 0.005, 2.0)
+
+    precip = weather["precip_mm"].values
+    drip = moving_average(precip, 17)  # ~4h lag proxy
+    drip = 0.6*drip + np.random.gamma(shape=1.8, scale=0.5, size=len(precip))
+    drip = np.clip(drip, 0.0, 30.0)
+
+    soil_m = np.clip(0.35 + 0.02*np.cumsum(precip - 0.2*np.ones(n))/100.0, 0.10, 0.70)
+    P_mbar = np.round(1013 + (mslp - mslp.mean()), 1)  # relative cave pressure proxy
+
+    df = pd.DataFrame({
+        "datetime": weather["datetime"],
+        "depth_m": depth_m,
+        "air_T_C": np.round(cave_t, 2),
+        "RH_%": np.round(rh, 1),
+        "P_mbar": P_mbar,
+        "O2_%": np.round(o2, 2),
+        "pCO2_ppm": np.round(co2, 0).astype(int),
+        "CH4_ppm": np.round(ch4, 3),
+        "H2_ppm": np.round(h2, 3),
+        "H2S_ppm": np.round(h2s, 3),
+        "radon_Bq_m3": np.round(radon, 0).astype(int),
+        "soil_moisture_%vol": np.round(soil_m, 3),
+        "drip_rate_ml_min": np.round(drip, 2),
+        "qc_flag": "OK",
+    })
+    return df
+
+# -----------------------------
+# Static tables
+# -----------------------------
+def build_sites(site_list: List[SiteArchetype]) -> pd.DataFrame:
+    rows = []
+    for i, s in enumerate(site_list, start=1):
+        site_id = f"SITE_{i:03d}"
+        if s.koppen in ["Af", "Cfb", "Cfc"]:   depth = 60
+        elif s.koppen in ["Cwa"]:              depth = 110
+        elif s.koppen in ["BWh", "BSk"]:       depth = 80
+        elif s.koppen in ["Dfd", "ET"]:        depth = 150
+        else:                                  depth = 90
+        litho_l1, litho_l2 = ("Carbonate","Limestone") if s.koppen in ["Cfb","Cfc"] else \
+                             ("Silicate","Basalt") if s.koppen in ["Af","Cwa","ET","Cfc"] else \
+                             ("Silicate","Granite")
+        porosity = {"Limestone":0.18, "Basalt":0.12, "Granite":0.03}[litho_l2]
+        perm = {"Limestone":1e-13, "Basalt":5e-14, "Granite":1e-16}[litho_l2]
+        rows.append({
+            "site_id": site_id,
+            "name": s.name.replace(",", ""),
+            "country": s.name.split(",")[-1].strip() if "," in s.name else "Unknown",
+            "region": s.name.split(",")[0],
+            "geom_wkt": f"POINT({s.lon} {s.lat})",
+            "epsg": 4326,
+            "depth_m": depth,
+            "elevation_m": s.elevation_m,
+            "litho_class_l1": litho_l1,
+            "litho_class_l2": litho_l2,
+            "porosity_frac": porosity,
+            "permeability_m2": perm,
+            "aquifer_type": "Karst" if litho_l2=="Limestone" else ("Volcanic-fractured" if litho_l2=="Basalt" else "Crystalline-fractured"),
+            "sediment_thickness_m": 200 if litho_l2!="Granite" else 50,
+            "crust_thickness_km": 30 if litho_l2!="Granite" else 45,
+            "heat_flow_mW_m2": 65.0 if litho_l2=="Limestone" else (200.0 if litho_l2=="Basalt" else 55.0),
+            "geothermal_gradient_C_per_km": 25.0 if litho_l2!="Granite" else 18.0,
+            "fault_distance_km": round(np.random.uniform(3, 30), 1),
+            "SHmax_azimuth_deg": int(np.random.uniform(0, 180)),
+            "stress_regime": np.random.choice(["Extensional","Strike-slip","Compressional"]),
+            "protected_area": bool(np.random.rand() < 0.3),
+            "land_use_class": np.random.choice(["Wilderness","Rural","Suburban","Industrial"]),
+            "source": "Synthetic_auto",
+            "license": "CC-BY-4.0",
+            "qc_flag": "OK",
+            "koppen": s.koppen,
+            "annual_T_mean_C": s.annual_T_mean,
+            "annual_precip_mm": s.annual_precip_mm,
+            "seasonal_amp_C": s.seasonal_amp,
+            "sea_influence": s.sea_influence,
+        })
+    return pd.DataFrame(rows)
+
+def build_rock_geochem(sites: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, r in sites.iterrows():
+        lith = r["litho_class_l2"]
+        if lith == "Limestone":
+            comp = dict(SiO2=3.5, CaO=52.0, MgO=1.5, Fe2O3=0.4, S=150, Ni=6, Co=2)
+        elif lith == "Basalt":
+            comp = dict(SiO2=49.0, CaO=11.0, MgO=7.0, Fe2O3=12.5, S=700, Ni=170, Co=50)
+        else:  # Granite
+            comp = dict(SiO2=72.0, CaO=2.0, MgO=0.7, Fe2O3=2.5, S=60, Ni=8, Co=3)
+        rows.append({
+            "site_id": r["site_id"],
+            "sample_id": f"{r['site_id']}-{lith[:3].upper()}-01",
+            "litho_class": lith,
+            "SiO2_wt%": comp["SiO2"],
+            "CaO_wt%": comp["CaO"],
+            "MgO_wt%": comp["MgO"],
+            "Fe2O3_wt%": comp["Fe2O3"],
+            "S_ppm": comp["S"],
+            "Ni_ppm": comp["Ni"],
+            "Co_ppm": comp["Co"],
+            "isotope_notes": "Synthetic isotope summary",
+            "source_ref": "Synthetic_auto",
+        })
+    return pd.DataFrame(rows)
+
+def build_biology(sites: pd.DataFrame, start: datetime) -> pd.DataFrame:
+    rows = []
+    for _, r in sites.iterrows():
+        lith = r["litho_class_l2"]
+        # biologically plausible flags by lithology
+        methanogen = 1 if lith in ["Basalt"] else 0
+        sulfur_red = 1 if lith in ["Limestone","Basalt"] else 0
+        iron_ox = 1 if lith in ["Granite","Limestone"] else 0
+        hydro = 1 if lith in ["Basalt","Limestone"] else 0
+        rows.append({
+            "site_id": r["site_id"],
+            "datetime": start.isoformat(),
+            "sequencing_type": np.random.choice(["16S","Shotgun"]),
+            "alpha_div": round(np.random.uniform(7, 22), 1),
+            "MAG_counts": int(np.random.randint(4, 25)),
+            "METHANOGENESIS": methanogen,
+            "SULFUR_REDUCTION": sulfur_red,
+            "IRON_OXIDATION": iron_ox,
+            "HYDROGENOTROPHY": hydro
+        })
+    return pd.DataFrame(rows)
+
+def build_water_chem_daily(sites: pd.DataFrame, weather_all: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows = []
+    for _, r in sites.iterrows():
+        sid = r["site_id"]
+        depth = float(r["depth_m"])
+        w = weather_all[sid].copy()
+        w["date"] = w["datetime"].dt.date
+        daily = w.groupby("date").agg({"t2m_C":"mean","precip_mm":"sum"}).reset_index()
+        for _, d in daily.iterrows():
+            base = {
+                "Limestone": dict(pH=7.5, TDS=400, Eh=150, DO=4.5),
+                "Basalt":    dict(pH=6.6, TDS=1500, Eh=60, DO=1.8),
+                "Granite":   dict(pH=8.0, TDS=800, Eh=300, DO=3.0),
+            }[r["litho_class_l2"]]
+            rows.append({
+                "site_id": sid,
+                "date": d["date"].isoformat(),
+                "depth_m": depth,
+                "pH": round(clamp(np.random.normal(base["pH"], 0.12), 5.5, 9.5), 2),
+                "Eh_mV": int(clamp(np.random.normal(base["Eh"], 20), -200, 600)),
+                "DO_mg_L": round(clamp(np.random.normal(base["DO"], 0.5), 0.0, 14.0), 2),
+                "TDS_mg_L": int(clamp(np.random.normal(base["TDS"], 60), 30, 6000)),
+                "NO3_mg_L": round(clamp(np.random.lognormal(-1.0, 0.5), 0.01, 20.0), 3),
+                "SO4_mg_L": round(clamp(np.random.lognormal(0.2, 0.6) *
+                                        (30 if r["litho_class_l2"]=="Limestone" else (100 if r["litho_class_l2"]=="Basalt" else 60)),
+                                        0.5, 1200.0), 2),
+                "Fe2_mg_L": round(clamp(np.random.lognormal(-0.2, 0.7), 0.005, 50.0), 3),
+                "Mn_mg_L": round(clamp(np.random.lognormal(-0.7, 0.6), 0.001, 10.0), 3),
+                "SiO2_mg_L": round(clamp(np.random.normal(25, 3), 1.0, 150.0), 2),
+                "CH4_ppm": round(clamp(np.random.lognormal(-2.0, 0.6), 0.05, 50.0), 3),
+                "H2_ppm": round(clamp(np.random.lognormal(-2.3, 0.7), 0.02, 10.0), 3),
+                "CO2_ppm": int(clamp(np.random.normal(1500, 250), 400, 20000)),
+                "qc_flag": "OK"
+            })
+    return pd.DataFrame(rows)
+
+def build_data_dictionary() -> pd.DataFrame:
+    entries = [
+        ("sites","site_id","string","Unique site identifier"),
+        ("sites","koppen","string","Köppen climate code"),
+        ("weather_15min","datetime","datetime","Timestamp (15-min)"),
+        ("weather_15min","t2m_C","float","2-m air temperature (°C) – surface driver"),
+        ("weather_15min","rh_%","float","Relative humidity (%)"),
+        ("weather_15min","mslp_hPa","float","Mean sea level pressure (hPa)"),
+        ("weather_15min","wind_m_s","float","10-m wind speed (m/s)"),
+        ("weather_15min","wind_gust_m_s","float","Wind gust (m/s)"),
+        ("weather_15min","precip_mm","float","Precipitation per 15 min (mm)"),
+        ("weather_15min","cloud_frac","float","Cloud fraction (0–1)"),
+        ("weather_15min","rad_MJ_m2","float","Shortwave radiation (MJ/m² per 15 min, scaled)"),
+        ("microclimate_15min","datetime","datetime","Timestamp (15-min)"),
+        ("microclimate_15min","air_T_C","float","Cave/underground air temperature (°C)"),
+        ("microclimate_15min","RH_%","float","Cave relative humidity (%)"),
+        ("microclimate_15min","pCO2_ppm","int","Cave CO₂ (ppm)"),
+        ("microclimate_15min","radon_Bq_m3","int","Cave radon (Bq/m³)"),
+        ("microclimate_15min","drip_rate_ml_min","float","Drip rate (mL/min)"),
+        ("water_chem_daily","date","date","Daily snapshot (local date)"),
+        ("water_chem_daily","pH","float","Groundwater pH (daily snapshot)"),
+        ("rock_geochem","SiO2_wt%","float","Rock silica % by weight"),
+        ("biology","METHANOGENESIS","0/1","Metabolic phenotype flag: methanogenesis potential"),
+        ("biology","SULFUR_REDUCTION","0/1","Metabolic phenotype flag: sulfur reduction potential"),
+        ("biology","IRON_OXIDATION","0/1","Metabolic phenotype flag: iron oxidation potential"),
+        ("biology","HYDROGENOTROPHY","0/1","Metabolic phenotype flag: hydrogenotrophy potential"),
+        ("events","event_type","string","Planned environmental event (storm, heatwave, cold_snap, vent_shift)"),
+        ("events","intensity","float","Event intensity on 0–1 scale"),
+    ]
+    return pd.DataFrame([{"table":t,"column":c,"type":ty,"description":d} for t,c,ty,d in entries])
+
+# -----------------------------
+# IO
+# -----------------------------
+def ensure_dirs():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CSV_DIR, exist_ok=True)
+
+def save_excel(tables: Dict[str, pd.DataFrame], path: str):
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        for name, df in tables.items():
+            if "datetime" in df.columns:
+                df = df.copy()
+                df["datetime"] = pd.to_datetime(df["datetime"])
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+
+def save_csv_pack(tables: Dict[str, pd.DataFrame], outdir: str, zip_path: str):
+    for name, df in tables.items():
+        df.to_csv(os.path.join(outdir, f"{name}.csv"), index=False)
+    readme = """# Subterra Full Dataset (Synthetic, Realistic, Smooth)
+- Resolution: 15 min (weather + cave); daily (water chemistry)
+- Events: storms, heatwaves, cold_snaps, ventilation_shifts (gradual ramps)
+- Smoothness: AR(1) + moving average + per-step rate limits
+- License: CC-BY-4.0 (generated data)
+"""
+    with open(os.path.join(outdir, "README.txt"), "w", encoding="utf-8") as f:
+        f.write(readme)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fn in os.listdir(outdir):
+            zf.write(os.path.join(outdir, fn), arcname=fn)
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    np.random.seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+
+    start, end = prompts_dates()
+    ensure_dirs()
+
+    log("Picking site archetypes…")
+    sites_list = auto_pick_sites(DEFAULT_NUM_SITES, rnd=random.Random(RANDOM_SEED))
+    sites_df = build_sites(sites_list)
+    log(f"Selected {len(sites_df)} sites: " + ", ".join(sites_df['site_id']))
+
+    all_events: List[Dict] = []
+    weather_by_site: Dict[str, pd.DataFrame] = {}
+    micro_by_site: Dict[str, pd.DataFrame] = {}
+
+    # Per-site iteration with live progress printing
+    for idx, s in sites_df.iterrows():
+        sid = s["site_id"]
+        name = s["name"]
+        koppen = s["koppen"]
+        log(f"[{sid}] Start: {name} (Köppen={koppen})")
+
+        try:
+            arch = next(a for a in sites_list if a.name.replace(",", "") == s["name"])
+
+            log(f"[{sid}] Planning events…")
+            events = plan_events(sid, start, end, koppen, rnd=random.Random(RANDOM_SEED ^ hash(sid)))
+            log(f"[{sid}] Planned {len(events)} events")
+
+            # Save events now
+            for ev in events:
+                all_events.append({
+                    "site_id": ev.site_id,
+                    "event_type": ev.event_type,
+                    "start": ev.start.isoformat(),
+                    "end": ev.end.isoformat(),
+                    "intensity": round(ev.intensity, 3)
+                })
+
+            log(f"[{sid}] Generating 15-min surface weather…")
+            w = generate_weather_series(arch, start, end, events)
+            w.insert(0, "site_id", sid)
+            weather_by_site[sid] = w
+            log(f"[{sid}] Weather rows: {len(w):,}")
+
+            log(f"[{sid}] Generating 15-min cave microclimate at depth={s['depth_m']} m…")
+            micro = generate_cave_series(w, arch, events, depth_m=float(s["depth_m"]))
+            micro.insert(0, "site_id", sid)
+            micro_by_site[sid] = micro
+            log(f"[{sid}] Microclimate rows: {len(micro):,}")
+
+            log(f"[{sid}] ✅ Done")
+        except Exception as e:
+            log(f"[{sid}] ❌ ERROR: {e}")
+            raise  # re-raise so you see tracebacks during development
+
+    log("Concatenating all sites’ weather and microclimate…")
+    weather_15 = pd.concat(weather_by_site.values(), ignore_index=True)
+    weather_15["datetime"] = pd.to_datetime(weather_15["datetime"])
+    micro_15 = pd.concat(micro_by_site.values(), ignore_index=True)
+    micro_15["datetime"] = pd.to_datetime(micro_15["datetime"])
+    log(f"All weather rows: {len(weather_15):,} | All micro rows: {len(micro_15):,}")
+
+    log("Building daily water chemistry…")
+    water_daily = build_water_chem_daily(sites_df, weather_by_site)
+    log(f"Water chemistry rows: {len(water_daily):,}")
+
+    log("Building rock geochemistry…")
+    rock_geo = build_rock_geochem(sites_df)
+    log(f"Rock geochem rows: {len(rock_geo):,}")
+
+    log("Building biology table (phenotype flags)…")
+    bio = build_biology(sites_df, start)
+    log(f"Biology rows: {len(bio):,}")
+
+    log("Assembling events and data dictionary…")
+    events_df = pd.DataFrame(all_events)
+    data_dict = build_data_dictionary()
+
+    # Export
+    tables = {
+        "sites": sites_df,
+        "events": events_df,
+        "weather_15min": weather_15,
+        "microclimate_15min": micro_15,
+        "water_chem_daily": water_daily,
+        "rock_geochem": rock_geo,
+        "biology": bio,
+        "data_dictionary": data_dict,
+    }
+
+    log("Writing Excel workbook…")
+    save_excel(tables, EXCEL_PATH)
+    log(f"Excel saved: {EXCEL_PATH}")
+
+    log("Writing CSV pack + ZIP…")
+    save_csv_pack(tables, CSV_DIR, ZIP_PATH)
+    log(f"CSV dir : {CSV_DIR}")
+    log(f"CSV zip : {ZIP_PATH}")
+
+    log("Sheets: " + ", ".join(tables.keys()))
+    log("✅ Dataset generation completed.")
+
+if __name__ == "__main__":
+    main()

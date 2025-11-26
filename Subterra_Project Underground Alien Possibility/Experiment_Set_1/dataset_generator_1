@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+Subterra Starter Dataset Generator (Synthetic but Earth-realistic)
+
+Outputs:
+  1) /output/subterra_dataset_starter.xlsx       (multi-sheet Excel)
+  2) /output/subterra_csv_pack.zip               (CSV pack + README)
+
+Tables:
+  - sites               : static site & geology
+  - microclimate        : underground air/chemistry time series
+  - water_chem          : groundwater chemistry snapshots
+  - rock_geochem        : simplified majors/traces
+  - biology             : analog functional potentials
+  - simulation_priors   : tolerance envelopes for hypothetical phenotypes
+  - data_dictionary     : column-level notes
+
+Author: Nova (ChatGPT) for Kumail / AI Cadmey
+License for generated data: CC-BY-4.0
+"""
+
+import os
+import json
+import math
+import random
+import zipfile
+from datetime import datetime, timedelta
+from typing import List
+
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+RANDOM_SEED = 777
+START_TIMESTAMP = datetime(2025, 10, 1, 0, 0, 0)
+MICROCLIMATE_STEPS = 24  # generate hourly-like samples; set 6 for a tiny demo
+
+OUTPUT_DIR = os.path.join(os.getcwd(), "output")
+EXCEL_PATH = os.path.join(OUTPUT_DIR, "subterra_dataset_starter.xlsx")
+CSV_DIR = os.path.join(OUTPUT_DIR, "subterra_csv_pack")
+ZIP_PATH = os.path.join(OUTPUT_DIR, "subterra_csv_pack.zip")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def ensure_dirs():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CSV_DIR, exist_ok=True)
+
+def set_seeds(seed: int):
+    np.random.seed(seed)
+    random.seed(seed)
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+def normal(mu, sigma, lo=None, hi=None, rnd=np.random):
+    v = rnd.normal(mu, sigma)
+    if lo is not None and hi is not None:
+        v = clamp(v, lo, hi)
+    return v
+
+def lognormal(mean, sigma, lo=None, hi=None, rnd=np.random):
+    v = rnd.lognormal(mean=mean, sigma=sigma)
+    if lo is not None and hi is not None:
+        v = clamp(v, lo, hi)
+    return v
+
+def gamma(shape, scale, lo=None, hi=None, rnd=np.random):
+    v = rnd.gamma(shape, scale)
+    if lo is not None and hi is not None:
+        v = clamp(v, lo, hi)
+    return v
+
+
+# -----------------------------
+# Sites table (static)
+# -----------------------------
+def build_sites() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "site_id": "UK_CAVE_001",
+            "name": "Mendip-Karst-Alpha",
+            "country": "United Kingdom",
+            "region": "Somerset",
+            "geom_wkt": "POINT(-2.719 51.285)",  # WGS84
+            "epsg": 4326,
+            "depth_m": 85,
+            "elevation_m": 260,
+            "litho_class_l1": "Carbonate",
+            "litho_class_l2": "Limestone",
+            "porosity_frac": 0.18,
+            "permeability_m2": 1e-13,
+            "aquifer_type": "Karst",
+            "sediment_thickness_m": 500,
+            "crust_thickness_km": 33,
+            "heat_flow_mW_m2": 65.0,
+            "geothermal_gradient_C_per_km": 25.0,
+            "fault_distance_km": 12.4,
+            "SHmax_azimuth_deg": 150,
+            "stress_regime": "Strike-slip",
+            "protected_area": True,
+            "land_use_class": "Rural",
+            "source": "Synthetic_demo",
+            "license": "CC-BY-4.0",
+            "qc_flag": "OK",
+        },
+        {
+            "site_id": "IS_BASALT_001",
+            "name": "Iceland-Basalt-LavaTube",
+            "country": "Iceland",
+            "region": "Suðurland",
+            "geom_wkt": "POINT(-18.777 64.115)",
+            "epsg": 4326,
+            "depth_m": 120,
+            "elevation_m": 410,
+            "litho_class_l1": "Silicate",
+            "litho_class_l2": "Basalt",
+            "porosity_frac": 0.12,
+            "permeability_m2": 5e-14,
+            "aquifer_type": "Volcanic-fractured",
+            "sediment_thickness_m": 200,
+            "crust_thickness_km": 26,
+            "heat_flow_mW_m2": 200.0,
+            "geothermal_gradient_C_per_km": 45.0,
+            "fault_distance_km": 3.2,
+            "SHmax_azimuth_deg": 20,
+            "stress_regime": "Extensional",
+            "protected_area": False,
+            "land_use_class": "Wilderness",
+            "source": "Synthetic_demo",
+            "license": "CC-BY-4.0",
+            "qc_flag": "OK",
+        },
+        {
+            "site_id": "US_GRANITE_001",
+            "name": "BlackHills-Granite-Mine",
+            "country": "USA",
+            "region": "South Dakota",
+            "geom_wkt": "POINT(-103.75 44.35)",
+            "epsg": 4326,
+            "depth_m": 900,
+            "elevation_m": 1500,
+            "litho_class_l1": "Silicate",
+            "litho_class_l2": "Granite",
+            "porosity_frac": 0.03,
+            "permeability_m2": 1e-16,
+            "aquifer_type": "Crystalline-fractured",
+            "sediment_thickness_m": 50,
+            "crust_thickness_km": 45,
+            "heat_flow_mW_m2": 55.0,
+            "geothermal_gradient_C_per_km": 18.0,
+            "fault_distance_km": 25.7,
+            "SHmax_azimuth_deg": 80,  # no leading zeros
+            "stress_regime": "Compressional",
+            "protected_area": False,
+            "land_use_class": "Industrial",
+            "source": "Synthetic_demo",
+            "license": "CC-BY-4.0",
+            "qc_flag": "OK",
+        },
+    ])
+
+
+# -----------------------------
+# Microclimate (time series)
+# -----------------------------
+def build_microclimate(sites: pd.DataFrame,
+                       start: datetime,
+                       steps: int,
+                       rnd=np.random) -> pd.DataFrame:
+    rows = []
+    for i, row in sites.iterrows():
+        sid = row["site_id"]
+        depth = float(row["depth_m"])
+        # site-specific baseline (°C) at depth
+        base_T = {"UK_CAVE_001": 11.5, "IS_BASALT_001": 22.0, "US_GRANITE_001": 30.0}[sid]
+        for t in range(steps):
+            ts = start + timedelta(hours=t)
+            air_T_C = round(normal(base_T, 0.25, base_T - 1.0, base_T + 1.0, rnd), 2)
+            rh = round(clamp(normal(96.0, 1.0), 85, 100), 1)
+            p = round(normal(1013.0, 2.0, 980, 1045), 1)
+            o2 = round(clamp(20.9 - rnd.uniform(0.3, 1.2), 17.0, 20.9), 2)
+            pco2 = int(clamp(normal(1400, 200), 500, 6000))
+            ch4 = round(clamp(lognormal(-1.8, 0.5), 0.3, 15.0), 3)
+            h2 = round(clamp(lognormal(-2.0, 0.6), 0.05, 8.0), 3)
+            h2s = round(clamp(lognormal(-3.0, 0.7), 0.005, 3.0), 3)
+            radon = int(clamp(normal({"UK_CAVE_001": 900, "IS_BASALT_001": 600, "US_GRANITE_001": 1500}[sid], 150),
+                              50, 8000))
+            soil_m = round(clamp(normal(0.38, 0.03), 0.10, 0.70), 3)
+            drip = round(clamp(rnd.gamma(shape=2.0, scale=0.8), 0.0, 30.0), 2)
+
+            rows.append({
+                "site_id": sid,
+                "datetime": ts.isoformat(),
+                "depth_m": depth,
+                "air_T_C": air_T_C,
+                "RH_%": rh,
+                "P_mbar": p,
+                "O2_%": o2,
+                "pCO2_ppm": pco2,
+                "CH4_ppm": ch4,
+                "H2_ppm": h2,
+                "H2S_ppm": h2s,
+                "radon_Bq_m3": radon,
+                "soil_moisture_%vol": soil_m,
+                "drip_rate_ml_min": drip,
+                "qc_flag": "OK",
+            })
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Water chemistry (snapshots)
+# -----------------------------
+def build_water_chem(sites: pd.DataFrame,
+                     base_time: datetime,
+                     rnd=np.random) -> pd.DataFrame:
+    rows = []
+    for i, row in sites.iterrows():
+        sid = row["site_id"]
+        depth = float(row["depth_m"])
+        baseline = {
+            "UK_CAVE_001": dict(pH=7.5, Eh=150, DO=4.5, TDS=400),
+            "IS_BASALT_001": dict(pH=6.5, Eh=50, DO=1.5, TDS=1500),
+            "US_GRANITE_001": dict(pH=8.1, Eh=300, DO=3.0, TDS=800),
+        }[sid]
+        for d in [depth - 5, depth, depth + 5]:
+            rows.append({
+                "site_id": sid,
+                "datetime": (base_time + timedelta(days=1)).isoformat(),
+                "depth_m": d,
+                "pH": round(clamp(normal(baseline["pH"], 0.12), 5.5, 9.5), 2),
+                "Eh_mV": int(clamp(normal(baseline["Eh"], 20), -200, 600)),
+                "DO_mg_L": round(clamp(normal(baseline["DO"], 0.4), 0.0, 14.0), 2),
+                "TDS_mg_L": int(clamp(normal(baseline["TDS"], 60), 30, 6000)),
+                "NO3_mg_L": round(clamp(lognormal(-1.0, 0.5), 0.01, 20.0), 3),
+                "SO4_mg_L": round(clamp(lognormal(0.2, 0.6) *
+                                        {"UK_CAVE_001": 30, "IS_BASALT_001": 100, "US_GRANITE_001": 60}[sid],
+                                        0.5, 1200.0), 2),
+                "Fe2_mg_L": round(clamp(lognormal(-0.2, 0.7), 0.005, 50.0), 3),
+                "Mn_mg_L": round(clamp(lognormal(-0.7, 0.6), 0.001, 10.0), 3),
+                "SiO2_mg_L": round(clamp(normal(25, 3), 1.0, 150.0), 2),
+                "CH4_ppm": round(clamp(lognormal(-2.0, 0.6), 0.05, 50.0), 3),
+                "H2_ppm": round(clamp(lognormal(-2.3, 0.7), 0.02, 10.0), 3),
+                "CO2_ppm": int(clamp(normal(1500, 250), 400, 20000)),
+                "qc_flag": "OK",
+            })
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Rock geochemistry
+# -----------------------------
+def build_rock_geochem() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"site_id": "UK_CAVE_001", "sample_id": "UK-LIM-01", "litho_class": "Limestone",
+         "CaO_wt%": 54.0, "MgO_wt%": 1.2, "SiO2_wt%": 3.1, "Fe2O3_wt%": 0.3,
+         "S_ppm": 120, "Ni_ppm": 5, "Co_ppm": 2, "isotope_notes": "δ13C, δ18O available",
+         "source_ref": "Synthetic_demo"},
+        {"site_id": "IS_BASALT_001", "sample_id": "IS-BAS-01", "litho_class": "Basalt",
+         "CaO_wt%": 10.5, "MgO_wt%": 7.2, "SiO2_wt%": 49.5, "Fe2O3_wt%": 12.0,
+         "S_ppm": 800, "Ni_ppm": 180, "Co_ppm": 55, "isotope_notes": "Sr-Nd isotopes available",
+         "source_ref": "Synthetic_demo"},
+        {"site_id": "US_GRANITE_001", "sample_id": "US-GRA-01", "litho_class": "Granite",
+         "CaO_wt%": 2.0, "MgO_wt%": 0.7, "SiO2_wt%": 72.0, "Fe2O3_wt%": 2.5,
+         "S_ppm": 50, "Ni_ppm": 8, "Co_ppm": 3, "isotope_notes": "Rb-Sr, U-Pb zircon ages",
+         "source_ref": "Synthetic_demo"},
+    ])
+
+
+# -----------------------------
+# Biology (Earth analogs)
+# -----------------------------
+def build_biology(start: datetime) -> pd.DataFrame:
+    return pd.DataFrame([
+        {"site_id": "UK_CAVE_001", "datetime": start.isoformat(), "sequencing_type": "16S", "alpha_div": 11.2,
+         "MAG_counts": 8, "METHANOGENESIS": 0, "SULFUR_REDUCTION": 1, "IRON_OXIDATION": 1, "HYDROGENOTROPHY": 1},
+        {"site_id": "IS_BASALT_001", "datetime": start.isoformat(), "sequencing_type": "Shotgun", "alpha_div": 18.7,
+         "MAG_counts": 21, "METHANOGENESIS": 1, "SULFUR_REDUCTION": 1, "IRON_OXIDATION": 0, "HYDROGENOTROPHY": 1},
+        {"site_id": "US_GRANITE_001", "datetime": start.isoformat(), "sequencing_type": "16S", "alpha_div": 7.9,
+         "MAG_counts": 5, "METHANOGENESIS": 0, "SULFUR_REDUCTION": 0, "IRON_OXIDATION": 1, "HYDROGENOTROPHY": 0},
+    ])
+
+
+# -----------------------------
+# Simulation priors
+# -----------------------------
+def build_simulation_priors() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"phenotype_id": "ALIEN_A_KARST", "description": "Moist, low-energy scavenger; slow metabolism",
+         "T_min_C": 4, "T_opt_C": 12, "T_max_C": 20, "O2_min_%": 17.5, "pCO2_max_ppm": 6000, "RH_min_%": 80,
+         "P_max_bar": 3, "radon_tol_Bq_m3": 2000, "pH_min": 6.0, "pH_max": 8.5,
+         "dominant_metabolisms": "SULFUR_REDUCTION,IRON_OXIDATION", "energy_kJ_per_day_est": 25},
+        {"phenotype_id": "ALIEN_B_BASALT", "description": "Chemolithoautotroph leveraging H2/CO2 in basaltic tubes",
+         "T_min_C": 10, "T_opt_C": 28, "T_max_C": 45, "O2_min_%": 1.0, "pCO2_max_ppm": 20000, "RH_min_%": 70,
+         "P_max_bar": 10, "radon_tol_Bq_m3": 5000, "pH_min": 5.0, "pH_max": 9.0,
+         "dominant_metabolisms": "METHANOGENESIS,HYDROGENOTROPHY,SULFUR_REDUCTION", "energy_kJ_per_day_est": 120},
+        {"phenotype_id": "ALIEN_C_GRANITE", "description": "Deep, low-porosity habitat; radiolysis-aided ecosystem",
+         "T_min_C": 6, "T_opt_C": 18, "T_max_C": 32, "O2_min_%": 5.0, "pCO2_max_ppm": 10000, "RH_min_%": 60,
+         "P_max_bar": 30, "radon_tol_Bq_m3": 8000, "pH_min": 6.5, "pH_max": 9.5,
+         "dominant_metabolisms": "HYDROGENOTROPHY,IRON_OXIDATION", "energy_kJ_per_day_est": 60},
+    ])
+
+
+# -----------------------------
+# Data dictionary (concise)
+# -----------------------------
+def build_data_dictionary() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"table": "sites", "column": "site_id", "type": "string", "description": "Unique site identifier"},
+        {"table": "sites", "column": "geom_wkt", "type": "WKT", "description": "Geometry in WKT (WGS84)"},
+        {"table": "sites", "column": "litho_class_l2", "type": "category", "description": "Detailed lithology"},
+        {"table": "microclimate", "column": "air_T_C", "type": "float", "description": "Underground air temperature (°C)"},
+        {"table": "microclimate", "column": "pCO2_ppm", "type": "integer", "description": "CO2 concentration (ppm)"},
+        {"table": "microclimate", "column": "radon_Bq_m3", "type": "integer", "description": "Radon concentration (Bq/m³)"},
+        {"table": "water_chem", "column": "Eh_mV", "type": "integer", "description": "Redox potential (mV)"},
+        {"table": "water_chem", "column": "TDS_mg_L", "type": "integer", "description": "Total dissolved solids (mg/L)"},
+        {"table": "rock_geochem", "column": "SiO2_wt%", "type": "float", "description": "Silica weight percent"},
+        {"table": "biology", "column": "METHANOGENESIS", "type": "0/1", "description": "Pathway potential flag"},
+        {"table": "simulation_priors", "column": "T_opt_C", "type": "float", "description": "Optimal temp for phenotype (°C)"},
+    ])
+
+
+# -----------------------------
+# Writing utilities
+# -----------------------------
+def save_excel(tables: dict, path: str):
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        for name, df in tables.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+
+def save_csv_pack(tables: dict, outdir: str, zip_path: str):
+    for name, df in tables.items():
+        df.to_csv(os.path.join(outdir, f"{name}.csv"), index=False)
+
+    readme_text = """# Subterra Dataset Starter (Demo)
+This pack contains exemplary tables for the Subterra Project:
+- sites: site-level static attributes and geology
+- microclimate: underground air chemistry/time series
+- water_chem: groundwater chemistry snapshots
+- rock_geochem: simplified rock composition
+- biology: analog microbial functional flags
+- simulation_priors: tolerance envelopes for hypothetical phenotypes
+- data_dictionary: column-level notes
+
+Licensing: CC-BY-4.0 (demo data). All values are synthetic but physically plausible.
+"""
+    with open(os.path.join(outdir, "README.txt"), "w", encoding="utf-8") as f:
+        f.write(readme_text)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for fn in os.listdir(outdir):
+            zipf.write(os.path.join(outdir, fn), arcname=fn)
+
+
+# -----------------------------
+# Main build
+# -----------------------------
+def main():
+    ensure_dirs()
+    set_seeds(RANDOM_SEED)
+
+    sites = build_sites()
+    microclimate = build_microclimate(sites, START_TIMESTAMP, MICROCLIMATE_STEPS)
+    water_chem = build_water_chem(sites, START_TIMESTAMP)
+    rock_geochem = build_rock_geochem()
+    biology = build_biology(START_TIMESTAMP)
+    simulation_priors = build_simulation_priors()
+    data_dictionary = build_data_dictionary()
+
+    tables = {
+        "sites": sites,
+        "microclimate": microclimate,
+        "water_chem": water_chem,
+        "rock_geochem": rock_geochem,
+        "biology": biology,
+        "simulation_priors": simulation_priors,
+        "data_dictionary": data_dictionary,
+    }
+
+    # Write Excel and CSV pack
+    save_excel(tables, EXCEL_PATH)
+    save_csv_pack(tables, CSV_DIR, ZIP_PATH)
+
+    print("✅ Done!")
+    print(f"Excel workbook: {EXCEL_PATH}")
+    print(f"CSV pack zip : {ZIP_PATH}")
+    print("Tables:", ", ".join(tables.keys()))
+
+
+if __name__ == "__main__":
+    main()

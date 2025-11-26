@@ -1,0 +1,51 @@
+{
+  "version": "moss_brain_v1",
+  "step": 1001,
+  "genotypes": [
+    {
+      "gid": 0,
+      "optima": {
+        "humidity": 0.6589714129668983,
+        "light": 0.07818781686503373,
+        "temperature": 30.793767700851152,
+        "pH": 7.286517402506076,
+        "nutrients": 0.09304632583058842
+      },
+      "tol": {
+        "humidity": 0.25,
+        "light": 0.35,
+        "temperature": 10.0,
+        "pH": 1.5,
+        "nutrients": 0.3
+      },
+      "parent": null,
+      "birth_step": 0,
+      "mut_history": [],
+      "exposure": {
+        "count": 20735781.0,
+        "humidity": 1000.828,
+        "light": 241.19531294427713,
+        "temperature": 13593.5,
+        "pH": 5205.1999999999025,
+        "nutrients": 652.2900000000067,
+        "stress_sum": 861.9179926209083
+      },
+      "biomass_sum": 4325.4463383536695
+    },
+    {
+      "gid": 1,
+      "optima": {
+        "humidity": 0.779258802056382,
+        "light": 0.3478771211725698,
+        "temperature": 11.95510116657888,
+        "pH": 5.516025004753525,
+        "nutrients": 0.3744997903842048
+      },
+      "tol": {
+        "humidity": 0.33272377354159477,
+        "light": 0.2017967091588392,
+        "temperature": 9.465824400498484,
+        "pH": 1.7042690155352935,
+        "nutrients": 0.36708596728143184
+      },
+      "parent": 

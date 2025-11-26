@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Subterra: Prediction Interface (uses trained regressors)
+--------------------------------------------------------
+- Loads LightGBM models from models/ and pipeline_config.json
+- Rebuilds lags/rolls from csv_pack for a given site_id & datetime
+- Predicts air_T_C, pCO2_ppm, radon_Bq_m3
+- Derives a simple 'alien life feasibility' score (heuristic)
+
+Usage:
+  python predict_subterra.py
+"""
+
+import json
+import os
+from pathlib import Path
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+from joblib import load
+
+DATA_DIR = Path("output_subterra/csv_pack")
+MODELS_DIR = Path("models")
+
+PIPELINE_PATH = MODELS_DIR / "pipeline_config.json"
+SITES_REF = MODELS_DIR / "sites_ref.csv"
+
+def _load_pipeline():
+    if not PIPELINE_PATH.exists():
+        raise FileNotFoundError(f"Missing {PIPELINE_PATH}. Train models first.")
+    with open(PIPELINE_PATH, "r") as f:
+        pipe = json.load(f)
+    # Load models
+    models = {}
+    for tgt, path in pipe["models"].items():
+        mp = Path(path)
+        if not mp.exists():
+            # also try relative in models/
+            mp = MODELS_DIR / f"lgbm_{tgt}.pkl"
+        if not mp.exists():
+            raise FileNotFoundError(f"Model for {tgt} not found at {path}")
+        models[tgt] = load(mp)
+    return pipe, models
+
+def _load_data(pipe):
+    sites = pd.read_csv(DATA_DIR / "sites.csv")
+    w15 = pd.read_csv(DATA_DIR / "weather_15min.csv", parse_dates=["datetime"])
+    m15 = pd.read_csv(DATA_DIR / "microclimate_15min.csv", parse_dates=["datetime"])
+
+    # keep relevant columns
+    weather_cols = pipe["weather_cols"]
+    micro_inputs = pipe["micro_inputs"]
+    targets = pipe["targets"]
+    site_static = pipe["site_static"]
+
+    w15 = w15[["site_id","datetime"] + weather_cols]
+    m15 = m15[["site_id","datetime"] + targets + micro_inputs]
+    df = (
+        m15.merge(w15, on=["site_id","datetime"], how="inner")
+           .merge(sites[["site_id"] + site_static], on="site_id", how="left")
+           .sort_values(["site_id","datetime"])
+           .reset_index(drop=True)
+    )
+
+    # categories
+    for c in pipe["cat_cols"]:
+        if c in df.columns:
+            df[c] = df[c].astype("category")
+    return df
+
+def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["minute_of_day"] = df["datetime"].dt.hour*60 + df["datetime"].dt.minute
+    df["hod_sin"] = np.sin(2*np.pi*df["minute_of_day"]/1440.0)
+    df["hod_cos"] = np.cos(2*np.pi*df["minute_of_day"]/1440.0)
+    df["doy"] = df["datetime"].dt.dayofyear
+    df["doy_sin"] = np.sin(2*np.pi*df["doy"]/365.0)
+    df["doy_cos"] = np.cos(2*np.pi*df["doy"]/365.0)
+    return df
+
+def _add_lag_roll_features(df: pd.DataFrame, pipe) -> pd.DataFrame:
+    lag_steps = pipe["lag_steps"]
+    roll_windows = pipe["roll_windows"]
+    covars = pipe["weather_cols"] + pipe["micro_inputs"]
+
+    df = df.sort_values(["site_id", "datetime"]).copy()
+
+    # Build all lag columns in one go (per column, per lag), then concat once
+    lag_frames = []
+    for c in covars:
+        if c not in df.columns:
+            continue
+        g = df.groupby("site_id")[c]
+        lag_dict = {f"{c}_lag{L}": g.shift(L) for L in lag_steps}
+        if lag_dict:
+            lag_frames.append(pd.DataFrame(lag_dict, index=df.index))
+
+    # Build all rolling means in one go
+    roll_frames = []
+    for c in covars:
+        if c not in df.columns:
+            continue
+        g = df.groupby("site_id")[c]
+        roll_dict = {
+            f"{c}_roll{W}m": g.transform(lambda s, W=W: s.rolling(
+                window=W, min_periods=max(2, int(0.5*W))
+            ).mean())
+            for W in roll_windows
+        }
+        if roll_dict:
+            roll_frames.append(pd.DataFrame(roll_dict, index=df.index))
+
+    # Concatenate features once to avoid fragmentation
+    extra = []
+    if lag_frames:
+        extra.append(pd.concat(lag_frames, axis=1))
+    if roll_frames:
+        extra.append(pd.concat(roll_frames, axis=1))
+
+    if extra:
+        df = pd.concat([df] + extra, axis=1)
+        # de-fragment copy
+        df = df.copy()
+
+    return df
+
+
+def _feasibility_from_micro(air_T_C, pCO2_ppm, radon_Bq_m3, RH_pct=None, O2_pct=None, H2S_ppm=None):
+    """
+    Simple transparent heuristic in [0..1] where higher means more favorable.
+    - air_T_C optimal around 8-18°C
+    - CO2 moderate (< 5000 ppm better)
+    - Radon lower is safer (< 2000 Bq/m3)
+    - Optional: RH near 80-100 helpful, O2 >= 19 good, H2S low is good
+    """
+    s = 0.0; w = 0.0
+
+    # Temperature
+    t = air_T_C
+    # score 1 at 12°C, triangle down to 0 at -5 and 30
+    t_score = max(0.0, 1.0 - abs(t - 12.0)/17.0)
+    s += 0.30 * t_score; w += 0.30
+
+    # CO2
+    c = pCO2_ppm
+    if c <= 5000:
+        c_score = 1.0
+    elif c <= 15000:
+        c_score = max(0.0, 1.0 - (c - 5000)/10000.0)
+    else:
+        c_score = 0.0
+    s += 0.25 * c_score; w += 0.25
+
+    # Radon
+    r = radon_Bq_m3
+    if r <= 2000:
+        r_score = 1.0
+    elif r <= 8000:
+        r_score = max(0.0, 1.0 - (r - 2000)/6000.0)
+    else:
+        r_score = 0.0
+    s += 0.20 * r_score; w += 0.20
+
+    # RH (optional)
+    if RH_pct is not None:
+        rh = RH_pct
+        rh_score = max(0.0, 1.0 - abs(rh - 90.0)/30.0)  # 60..100 yields 1..0.67+
+        s += 0.10 * rh_score; w += 0.10
+
+    # O2 (optional)
+    if O2_pct is not None:
+        o2 = O2_pct
+        o2_score = 1.0 if o2 >= 19.0 else max(0.0, (o2 - 16.0)/3.0)
+        s += 0.10 * o2_score; w += 0.10
+
+    # H2S (optional)
+    if H2S_ppm is not None:
+        h2s = H2S_ppm
+        if h2s <= 0.1:
+            h2s_score = 1.0
+        elif h2s <= 5.0:
+            h2s_score = max(0.0, 1.0 - (h2s - 0.1)/4.9)
+        else:
+            h2s_score = 0.0
+        s += 0.05 * h2s_score; w += 0.05
+
+    return 0.0 if w == 0 else float(np.clip(s / w, 0, 1))
+
+def main():
+    print("🔮 Subterra Predictor")
+    print("---------------------")
+
+    pipe, models = _load_pipeline()
+    df = _load_data(pipe)
+    df = _add_time_features(df)
+    df = _add_lag_roll_features(df, pipe)
+
+    # ask user which site/time to score (must exist in csv_pack)
+    avail_sites = sorted(df["site_id"].unique().tolist())
+    print(f"Available site_ids: {', '.join(avail_sites)}")
+    site_id = input("Enter site_id: ").strip()
+    if site_id not in avail_sites:
+        print("❌ Unknown site_id.")
+        return
+
+    # show time range for this site
+    dsite = df[df["site_id"] == site_id].sort_values("datetime")
+    tmin = dsite["datetime"].min()
+    tmax = dsite["datetime"].max()
+    print(f"Time range for {site_id}: {tmin} .. {tmax}")
+    ts_str = input("Enter timestamp to predict (YYYY-MM-DD HH:MM, must exist): ").strip()
+
+    try:
+        # pandas to_datetime tolerant parse
+        ts = pd.to_datetime(ts_str)
+    except Exception:
+        print("❌ Unable to parse datetime.")
+        return
+
+    # find exact row (we predict for that row’s current state)
+    row = dsite[dsite["datetime"] == ts]
+    if row.empty:
+        print("❌ Timestamp not found for that site. Pick an existing 15-min slot.")
+        return
+
+    # drop NA (if lags/rolls at head of series)
+    row = row.dropna(axis=1, how="all")
+    # features per target must match training’s feature list
+    preds = {}
+    for tgt in pipe["targets"]:
+        feats = pipe["features_used"][tgt]
+        # Some features might be missing at the selected timestamp (head NA) -> try previous timestamp(s)
+        r = row.copy()
+        # If any required feature is NA/missing, look back up to 96 steps (~24h) for a non-NA row
+        if (len(set(feats) - set(r.columns)) > 0) or r[feats].isna().any(axis=None):
+            lookback = 96
+            candidates = dsite[(dsite["datetime"] <= ts) & (~dsite[feats].isna().any(axis=1))]
+            if len(candidates) == 0:
+                print(f"⚠️ No complete feature row available for {tgt} at or before {ts}. Skipping.")
+                continue
+            r = candidates.iloc[[-1]]
+
+        # categorical dtype fix
+        for c in pipe["cat_cols"]:
+            if c in r.columns and str(r[c].dtype) != "category":
+                r[c] = r[c].astype("category")
+
+        model = models[tgt]
+        best_it = getattr(model, "best_iteration", None)
+        yhat = model.predict(r[feats], num_iteration=best_it)
+        preds[tgt] = float(np.asarray(yhat).ravel()[0])
+
+    # also grab some current ancillary vars if present for feasibility
+    # (use the exact row at ts if possible, otherwise the row used for prediction)
+    base_row = dsite[dsite["datetime"] == ts]
+    if base_row.empty:
+        base_row = r
+    rh = float(base_row["RH_%"].iloc[0]) if "RH_%" in base_row.columns else None
+    o2 = float(base_row["O2_%"].iloc[0]) if "O2_%" in base_row.columns else None
+    h2s = float(base_row["H2S_ppm"].iloc[0]) if "H2S_ppm" in base_row.columns else None
+
+    # Results
+    air_T = preds.get("air_T_C", np.nan)
+    co2   = preds.get("pCO2_ppm", np.nan)
+    radon = preds.get("radon_Bq_m3", np.nan)
+
+    print("\n📈 Predictions")
+    if "air_T_C" in preds:     print(f"  air_T_C (°C)     : {air_T:.2f}")
+    if "pCO2_ppm" in preds:    print(f"  pCO2 (ppm)       : {co2:,.0f}")
+    if "radon_Bq_m3" in preds: print(f"  radon (Bq/m³)    : {radon:,.0f}")
+
+    # Feasibility heuristic
+    feas = _feasibility_from_micro(air_T, co2, radon, RH_pct=rh, O2_pct=o2, H2S_ppm=h2s)
+    verdict = "✅ ALIEN LIFE POSSIBLE" if feas >= 0.5 else "❌ Alien life unlikely"
+    print("\n🧪 Feasibility (heuristic)")
+    print(f"  Score: {feas:.3f}  ->  {verdict}")
+
+if __name__ == "__main__":
+    main()

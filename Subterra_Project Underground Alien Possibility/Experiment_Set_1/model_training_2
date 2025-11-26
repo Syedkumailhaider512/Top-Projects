@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Train Subterra Models (LightGBM baseline, saves pipeline config for inference)
+
+Inputs (created by the generator):
+  output_subterra/csv_pack/{sites.csv, weather_15min.csv, microclimate_15min.csv}
+
+Outputs:
+  models/lgbm_air_T_C.pkl
+  models/lgbm_pCO2_ppm.pkl
+  models/lgbm_radon_Bq_m3.pkl
+  models/feature_importance_<target>.csv
+  models/pipeline_config.json
+  models/sites_ref.csv
+  reports/metrics.csv
+"""
+
+import os, json, warnings
+from pathlib import Path
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+from joblib import dump
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import lightgbm as lgb
+
+# ----------------------------
+# Config
+# ----------------------------
+DATA_DIR = Path("output_subterra/csv_pack")
+MODELS_DIR = Path("models")
+REPORTS_DIR = Path("reports")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+TARGETS = ["air_T_C", "pCO2_ppm", "radon_Bq_m3"]
+
+WEATHER_COLS = [
+    "t2m_C", "rh_%", "mslp_hPa", "wind_m_s", "wind_gust_m_s",
+    "precip_mm", "cloud_frac", "rad_MJ_m2", "daylength_h"
+]
+
+# IMPORTANT: include depth_m from microclimate (not from sites) to avoid column clashes
+MICRO_INPUTS = [
+    "RH_%", "P_mbar", "O2_%", "CH4_ppm", "H2_ppm", "H2S_ppm",
+    "soil_moisture_%vol", "drip_rate_ml_min", "depth_m"
+]
+
+SITE_STATIC = [
+    "elevation_m", "litho_class_l1", "litho_class_l2", "porosity_frac",
+    "permeability_m2", "aquifer_type", "sediment_thickness_m",
+    "crust_thickness_km", "heat_flow_mW_m2", "geothermal_gradient_C_per_km",
+    "fault_distance_km", "SHmax_azimuth_deg", "stress_regime", "protected_area",
+    "land_use_class", "koppen", "annual_T_mean_C", "annual_precip_mm",
+    "seasonal_amp_C", "sea_influence"
+]
+CAT_COLS = [
+    "litho_class_l1","litho_class_l2","aquifer_type","stress_regime",
+    "land_use_class","koppen","protected_area"
+]
+
+# Lags & rolling windows (15-min steps)
+LAG_STEPS = [1,2,3,4,8,12,16,24,32,48,64,96]   # up to 24h
+ROLL_WINDOWS = [4,8,16,24,48,96]               # ~1h..24h
+
+RANDOM_SEED = 42
+
+
+# ----------------------------
+# Load & merge
+# ----------------------------
+def load_data():
+    print("📂 Loading dataset...")
+    sites = pd.read_csv(DATA_DIR / "sites.csv")
+    w15 = pd.read_csv(DATA_DIR / "weather_15min.csv", parse_dates=["datetime"])
+    m15 = pd.read_csv(DATA_DIR / "microclimate_15min.csv", parse_dates=["datetime"])
+
+    # keep relevant
+    w15 = w15[["site_id","datetime"] + WEATHER_COLS]
+    m15 = m15[["site_id","datetime"] + TARGETS + MICRO_INPUTS]
+
+    df = (
+        m15.merge(w15, on=["site_id","datetime"], how="inner")
+           .merge(sites[["site_id"] + SITE_STATIC], on="site_id", how="left")
+           .sort_values(["site_id","datetime"])
+           .reset_index(drop=True)
+    )
+    for c in CAT_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype("category")
+
+    return df, sites
+
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["minute_of_day"] = df["datetime"].dt.hour*60 + df["datetime"].dt.minute
+    df["hod_sin"] = np.sin(2*np.pi*df["minute_of_day"]/1440.0)
+    df["hod_cos"] = np.cos(2*np.pi*df["minute_of_day"]/1440.0)
+    df["doy"] = df["datetime"].dt.dayofyear
+    df["doy_sin"] = np.sin(2*np.pi*df["doy"]/365.0)
+    df["doy_cos"] = np.cos(2*np.pi*df["doy"]/365.0)
+    return df
+
+
+def add_lag_roll_features(df: pd.DataFrame) -> pd.DataFrame:
+    print("🧠 Preparing training data (lags & rolls)...")
+    df = df.sort_values(["site_id","datetime"]).copy()
+    covars = WEATHER_COLS + MICRO_INPUTS
+    for c in covars:
+        if c not in df.columns:
+            continue
+        # Lags
+        for L in LAG_STEPS:
+            df[f"{c}_lag{L}"] = df.groupby("site_id")[c].shift(L)
+        # Rolling means (min half-window to allow early values)
+        for W in ROLL_WINDOWS:
+            df[f"{c}_roll{W}m"] = (
+                df.groupby("site_id")[c]
+                  .transform(lambda s: s.rolling(window=W, min_periods=max(2, int(0.5*W))).mean())
+            )
+    return df
+
+
+def drop_na_causal(df: pd.DataFrame) -> pd.DataFrame:
+    before = len(df)
+    df = df.dropna().reset_index(drop=True)
+    dropped = before - len(df)
+    print(f"🧹 Dropped {dropped} rows after building causal features.")
+    return df
+
+
+def time_split_per_site(df, train_frac=0.8, val_frac=0.1):
+    train_list, val_list, test_list = [], [], []
+    for _, d in df.groupby("site_id"):
+        d = d.sort_values("datetime")
+        n = len(d)
+        n_train = int(n*train_frac)
+        n_val = int(n*val_frac)
+        train_list.append(d.iloc[:n_train])
+        val_list.append(d.iloc[n_train:n_train+n_val])
+        test_list.append(d.iloc[n_train+n_val:])
+    return (pd.concat(train_list).reset_index(drop=True),
+            pd.concat(val_list).reset_index(drop=True),
+            pd.concat(test_list).reset_index(drop=True))
+
+
+# ----------------------------
+# Train one target
+# ----------------------------
+def train_one(train, val, test, target, exclude_cols):
+    print(f"\n🚀 Training LightGBM for target: {target}")
+
+    feats_all = [c for c in train.columns if c not in exclude_cols + TARGETS]
+    # drop missing feature columns (robust against schema drift)
+    missing = [c for c in feats_all if c not in train.columns]
+    if missing:
+        print(f"⚠️  Missing feature columns in train (dropping): {missing}")
+    feats = [c for c in feats_all if c in train.columns]
+
+    # categorical features
+    cat_feats = [c for c in feats if str(train[c].dtype) == "category"]
+
+    # final safety: ensure features exist in val/test as well
+    for split_name, split_df in [("val", val), ("test", test)]:
+        split_missing = [c for c in feats if c not in split_df.columns]
+        if split_missing:
+            print(f"⚠️  {split_name} split missing features (dropping): {split_missing}")
+            feats = [c for c in feats if c in split_df.columns]
+
+    dtrain = lgb.Dataset(
+        train[feats], label=train[target],
+        categorical_feature=cat_feats if cat_feats else None,
+        free_raw_data=False
+    )
+    dval = lgb.Dataset(
+        val[feats], label=val[target],
+        categorical_feature=cat_feats if cat_feats else None,
+        free_raw_data=False
+    )
+
+    params = dict(
+        objective="regression",
+        metric=["l2", "l1"],
+        seed=RANDOM_SEED,
+        learning_rate=0.05,
+        num_leaves=64,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        min_data_in_leaf=50,
+        lambda_l2=2.0,
+        verbosity=-1
+    )
+
+    # Log every iteration so you can watch it working
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=200, verbose=True),
+        lgb.log_evaluation(period=1)  # <- per-iteration logging
+    ]
+
+    model = lgb.train(
+        params,
+        dtrain,
+        num_boost_round=5000,
+        valid_sets=[dtrain, dval],
+        valid_names=["train", "val"],
+        callbacks=callbacks
+    )
+
+    # Evaluate
+    def score(split_name, df_split):
+        y = df_split[target].values
+        best_it = getattr(model, "best_iteration", None)
+        yhat = model.predict(df_split[feats], num_iteration=best_it)
+        yhat = np.asarray(yhat).ravel()
+        mae = mean_absolute_error(y, yhat)
+        rmse = float(np.sqrt(mean_squared_error(y, yhat)))
+        r2 = r2_score(y, yhat)
+        print(f"📊 {target} | {split_name:5s} | MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}")
+        return {"split": split_name, "target": target, "MAE": mae, "RMSE": rmse, "R2": r2}
+
+    metrics = [score("train", train), score("val", val), score("test", test)]
+
+    # Save model and importance
+    model_path = MODELS_DIR / f"lgbm_{target}.pkl"
+    dump(model, model_path)
+    fi = pd.DataFrame({
+        "feature": feats,
+        "gain": model.feature_importance(importance_type="gain")
+    }).sort_values("gain", ascending=False)
+    fi.to_csv(MODELS_DIR / f"feature_importance_{target}.csv", index=False)
+    print(f"💾 Saved model to {model_path}")
+
+    return model, feats, fi, metrics
+
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    df, sites = load_data()
+
+    df = add_time_features(df)
+    df = add_lag_roll_features(df)
+    df = drop_na_causal(df)
+
+    exclude = ["site_id","datetime","minute_of_day","doy"]
+
+    train, val, test = time_split_per_site(df, 0.8, 0.1)
+
+    all_metrics = []
+    models = {}
+    features_used = {}
+
+    for tgt in TARGETS:
+        model, feats, fi, metrics = train_one(train, val, test, tgt, exclude)
+        models[tgt] = str(MODELS_DIR / f"lgbm_{tgt}.pkl")
+        features_used[tgt] = feats
+        all_metrics.extend(metrics)
+
+    pd.DataFrame(all_metrics).to_csv(REPORTS_DIR / "metrics.csv", index=False)
+    print("📑 Metrics saved -> reports/metrics.csv")
+
+    # Save pipeline config
+    pipeline = dict(
+        targets=TARGETS,
+        weather_cols=WEATHER_COLS,
+        micro_inputs=MICRO_INPUTS,
+        site_static=SITE_STATIC,
+        cat_cols=CAT_COLS,
+        lag_steps=LAG_STEPS,
+        roll_windows=ROLL_WINDOWS,
+        exclude_cols=exclude,
+        features_used=features_used,
+        models=models
+    )
+    with open(MODELS_DIR / "pipeline_config.json","w") as f:
+        json.dump(pipeline, f, indent=2)
+
+    # Reference for inference
+    sites.to_csv(MODELS_DIR / "sites_ref.csv", index=False)
+
+    print("✅ Done. pipeline_config.json and reference CSV saved under models/")
+
+if __name__ == "__main__":
+    main()

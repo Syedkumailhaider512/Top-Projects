@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Predict alien-life viability over a date period using saved Subterra models.
+"""
+
+import json
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+from joblib import load
+
+# Silence the FutureWarning and opt into the future behavior
+pd.set_option('future.no_silent_downcasting', True)
+
+# ---- Paths (keep same structure as your project) ----
+MODELS_DIR = Path("models")
+DATA_DIR   = Path("output_subterra/csv_pack")
+
+# -----------------------------------------------------
+# Utilities
+# -----------------------------------------------------
+
+def add_time_features_inplace(df: pd.DataFrame) -> None:
+    if "datetime" not in df.columns:
+        return
+    dt = pd.to_datetime(df["datetime"])
+    mod = dt.dt.hour * 60 + dt.dt.minute
+    df["minute_of_day"] = mod
+    df["hod_sin"] = np.sin(2*np.pi*mod/1440.0)
+    df["hod_cos"] = np.cos(2*np.pi*mod/1440.0)
+    doy = dt.dt.dayofyear
+    df["doy"] = doy
+    df["doy_sin"] = np.sin(2*np.pi*doy/365.0)
+    df["doy_cos"] = np.cos(2*np.pi*doy/365.0)
+
+def load_pipeline():
+    with open(MODELS_DIR / "pipeline_config.json","r") as f:
+        cfg = json.load(f)
+    models = {t: load(MODELS_DIR / f"lgbm_{t}.pkl") for t in cfg["targets"]}
+    sites_ref = pd.read_csv(MODELS_DIR / "sites_ref.csv")
+    priors_path = MODELS_DIR / "simulation_priors_ref.csv"
+    priors = pd.read_csv(priors_path) if priors_path.exists() else None
+    return cfg, models, sites_ref, priors
+
+def load_dataframes():
+    sites = pd.read_csv(DATA_DIR / "sites.csv")
+    w15 = pd.read_csv(DATA_DIR / "weather_15min.csv", parse_dates=["datetime"])
+    m15 = pd.read_csv(DATA_DIR / "microclimate_15min.csv", parse_dates=["datetime"])
+    return sites, w15, m15
+
+def pick_phenotype(priors: pd.DataFrame|None, litho: str):
+    if priors is None:
+        return None
+    if litho == "Limestone":
+        pid = "ALIEN_A_KARST"
+    elif litho == "Basalt":
+        pid = "ALIEN_B_BASALT"
+    else:
+        pid = "ALIEN_C_GRANITE"
+    p = priors[priors["phenotype_id"]==pid]
+    return p.iloc[0] if not p.empty else priors.iloc[0]
+
+def o2_from_co2(co2_ppm: float) -> float:
+    return float(np.clip(20.9 - (co2_ppm - 400)/8000.0, 18.0, 20.9))
+
+def viability_score(preds: dict, phen: pd.Series|None) -> float:
+    if phen is None:
+        return 0.5
+
+    T = preds["air_T_C"]
+    CO2 = preds["pCO2_ppm"]
+    RAD = preds["radon_Bq_m3"]
+    RH = preds.get("RH_%", 90.0)
+    O2 = preds.get("O2_%", o2_from_co2(CO2))
+
+    tmin, topt, tmax = phen["T_min_C"], phen["T_opt_C"], phen["T_max_C"]
+    o2min = phen["O2_min_%"]
+    co2max = phen["pCO2_max_ppm"]
+    rhmin = phen["RH_min_%"]
+    radtol = phen["radon_tol_Bq_m3"]
+
+    if T < tmin or T > tmax:
+        sT = 0.0
+    else:
+        width = max(1.0, (tmax - tmin)/2.0)
+        sT = float(np.exp(-((T - topt)/width)**2))
+
+    sO2 = 1.0 if O2 >= o2min else float(np.clip((O2 - (o2min-2.0))/2.0, 0.0, 1.0))
+    sCO2 = 1.0 if CO2 <= co2max else float(np.clip((co2max*1.2 - CO2) / (0.2*co2max), 0.0, 1.0))
+    sRH  = 1.0 if RH >= rhmin else float(np.clip((RH - (rhmin-10))/10.0, 0.0, 1.0))
+    sRAD = 1.0 if RAD <= radtol else float(np.clip((radtol*1.5 - RAD)/(0.5*radtol), 0.0, 1.0))
+
+    weights = np.array([0.35, 0.15, 0.2, 0.15, 0.15])
+    parts = np.array([sT, sO2, sCO2, sRH, sRAD]) + 1e-9
+    score = float(np.exp(np.sum(weights*np.log(parts))))
+    return float(np.clip(score, 0.0, 1.0))
+
+# -----------------------------------------------------
+# Feature helpers
+# -----------------------------------------------------
+
+def ensure_features_one_row(row_df: pd.DataFrame, feats_needed, history_for_fill: pd.DataFrame) -> pd.DataFrame:
+    row_df = row_df.copy()
+    missing = [c for c in feats_needed if c not in row_df.columns]
+    if missing:
+        fill_vals = {}
+        for m in missing:
+            if m in history_for_fill.columns:
+                fill_vals[m] = history_for_fill[m].median()
+            else:
+                fill_vals[m] = 0.0
+        row_df = pd.concat([row_df, pd.DataFrame([fill_vals])], axis=1)
+        row_df = row_df.copy()
+    row_df = row_df.reindex(columns=feats_needed, fill_value=0.0)
+    return row_df
+
+def build_features_row_strict_past(cfg, site_id, when, df_hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a single one-row feature vector at 'when' using strictly past data for lags/rolls.
+    Never indexes a missing column; missing covariate → NaN lags/rolls.
+    """
+    df_hist = df_hist.copy().sort_values("datetime")
+    if "hod_sin" not in df_hist.columns:
+        add_time_features_inplace(df_hist)
+
+    row_now = df_hist[df_hist["datetime"] == when]
+    if row_now.empty:
+        past = df_hist[df_hist["datetime"] < when]
+        if past.empty:
+            raise ValueError("Not enough history before this timestamp to construct features.")
+        base = past.iloc[-1].copy()
+        base["datetime"] = when
+        row = pd.DataFrame([base])
+    else:
+        row = row_now.iloc[[0]].copy()
+
+    row["datetime"] = pd.to_datetime(row["datetime"])
+    add_time_features_inplace(row)
+
+    hist = df_hist[df_hist["datetime"] < when].copy()
+    if hist.empty:
+        raise ValueError("Not enough history to compute lags/rollings. Pick a later timestamp.")
+
+    covars = cfg["weather_cols"] + cfg["micro_inputs"]
+    max_need = max(cfg["lag_steps"] + cfg["roll_windows"])
+    hist_tail = hist.tail(max_need + 1)
+
+    new_vals = {}
+    for c in covars:
+        # LAGS
+        for L in cfg["lag_steps"]:
+            key = f"{c}_lag{L}"
+            if c in hist_tail.columns and len(hist_tail) >= L:
+                try:
+                    new_vals[key] = hist_tail[c].iloc[-L]
+                except Exception:
+                    new_vals[key] = np.nan
+            else:
+                new_vals[key] = np.nan
+        # ROLLINGS
+        for W in cfg["roll_windows"]:
+            key = f"{c}_roll{W}m"
+            if c in hist_tail.columns and len(hist_tail) >= 2:
+                try:
+                    new_vals[key] = hist_tail[c].tail(W).mean()
+                except Exception:
+                    new_vals[key] = np.nan
+            else:
+                new_vals[key] = np.nan
+
+    feat_extras = pd.DataFrame([new_vals])
+    row = pd.concat([row.reset_index(drop=True), feat_extras], axis=1)
+
+    # Fill across the single row, then make dtypes sane
+    row = row.ffill(axis=1).bfill(axis=1)
+    row = row.infer_objects(copy=False)
+    return row
+
+def ad_hoc_history_stub(cfg, site_row, when, user_covars):
+    steps = max(cfg["lag_steps"] + cfg["roll_windows"])
+    times = [when - timedelta(minutes=15*i) for i in range(steps, 0, -1)] + [when]
+    n = len(times)
+
+    data = {"site_id": [site_row["site_id"]]*n, "datetime": times}
+    for c in cfg["weather_cols"]:
+        data[c] = [user_covars.get(c, np.nan)]*n
+    for c in cfg["micro_inputs"]:
+        if c == "depth_m":
+            data[c] = [site_row["depth_m"]]*n
+        else:
+            data[c] = [user_covars.get(c, np.nan)]*n
+
+    df = pd.DataFrame(data)
+    add_time_features_inplace(df)
+    return df
+
+# -----------------------------------------------------
+# Prediction over a period
+# -----------------------------------------------------
+
+def predict_for_period(cfg, models, site, w15, m15, phen, start, end, mode="dataset", ad_hoc_cov=None):
+    sid = site["site_id"]
+
+    if mode == "dataset":
+        df_w = w15[w15["site_id"] == sid].copy()
+        df_m = m15[m15["site_id"] == sid].copy()
+        df_hist = pd.merge(df_w, df_m, on=["site_id", "datetime"], how="outer").sort_values("datetime").reset_index(drop=True)
+        for col in cfg["site_static"]:
+            df_hist[col] = site[col]
+        add_time_features_inplace(df_hist)
+        window_mask = (df_hist["datetime"] >= start) & (df_hist["datetime"] <= end)
+        times = df_hist.loc[window_mask, "datetime"].drop_duplicates().tolist()
+    else:
+        times = pd.date_range(start, end, freq="15min").to_pydatetime().tolist()
+        df_hist = ad_hoc_history_stub(cfg, site, end, ad_hoc_cov)
+        for col in cfg["site_static"]:
+            df_hist[col] = site[col]
+        add_time_features_inplace(df_hist)
+
+    if not times:
+        print("⚠️ No timestamps in window. Check your dataset or date range.")
+        return pd.DataFrame(columns=["datetime", "site_id", "air_T_C", "pCO2_ppm", "radon_Bq_m3",
+                                     "O2_%", "RH_%", "viability_score", "viable"])
+
+    results = []
+    print(f"\n🌍 Starting predictions for {sid} from {start} to {end} ({len(times)} steps)\n")
+
+    for i, t in enumerate(times, 1):
+        try:
+            if mode == "dataset":
+                feat_row = build_features_row_strict_past(cfg, sid, t, df_hist)
+            else:
+                hist_t = ad_hoc_history_stub(cfg, site, t, ad_hoc_cov)
+                for col in cfg["site_static"]:
+                    hist_t[col] = site[col]
+                feat_row = build_features_row_strict_past(cfg, sid, t, hist_t)
+
+            for col in cfg["site_static"]:
+                if col not in feat_row.columns:
+                    feat_row[col] = site[col]
+            for c in cfg.get("cat_cols", []):
+                if c in feat_row.columns:
+                    feat_row[c] = feat_row[c].astype("category")
+
+            preds = {}
+            for tgt in cfg["targets"]:
+                feats = cfg["features_used"][tgt]
+                row_for_tgt = ensure_features_one_row(feat_row, feats, df_hist)
+                best_it = getattr(models[tgt], "best_iteration_", None)
+                yhat = models[tgt].predict(row_for_tgt, num_iteration=best_it)
+                preds[tgt] = float(np.asarray(yhat).ravel()[0])
+
+            preds["O2_%"] = o2_from_co2(preds["pCO2_ppm"])
+            RHv = float(feat_row["RH_%"].iloc[0]) if "RH_%" in feat_row.columns and pd.notna(feat_row["RH_%"].iloc[0]) else 90.0
+            preds["RH_%"] = RHv
+
+            score = viability_score(preds, phen)
+            decision = "YES" if score >= 0.60 else "NO"
+
+            results.append({
+                "datetime": t,
+                "site_id": sid,
+                "air_T_C": preds["air_T_C"],
+                "pCO2_ppm": preds["pCO2_ppm"],
+                "radon_Bq_m3": preds["radon_Bq_m3"],
+                "O2_%": preds["O2_%"],
+                "RH_%": preds["RH_%"],
+                "viability_score": score,
+                "viable": decision
+            })
+
+            # 🔵 Live printing
+            print(f"[{i:04d}/{len(times)}] {t:%Y-%m-%d %H:%M}  "
+                  f"T={preds['air_T_C']:.2f}°C | CO₂={preds['pCO2_ppm']:.0f}ppm | "
+                  f"Radon={preds['radon_Bq_m3']:.0f}Bq/m³ | O₂={preds['O2_%']:.2f}% | "
+                  f"Score={score:.2f} → Life: {decision}")
+
+        except ValueError:
+            print(f"[{i:04d}] Skipped {t:%Y-%m-%d %H:%M} (not enough history yet)")
+            continue
+        except Exception as e:
+            print(f"[{i:04d}] Error at {t:%Y-%m-%d %H:%M}: {e}")
+            continue
+
+    print("\n✅ Prediction loop finished.")
+    return pd.DataFrame(results).sort_values("datetime").reset_index(drop=True)
+
+
+def summarize_viable_days(df_pred: pd.DataFrame) -> pd.DataFrame:
+    if df_pred.empty:
+        return pd.DataFrame(columns=["date","any_yes","first_yes","last_yes"])
+    df_pred["date"] = df_pred["datetime"].dt.date
+    def agg(g):
+        yes = g[g["viable"]=="YES"]["datetime"]
+        return pd.Series({
+            "any_yes": bool(len(yes)>0),
+            "first_yes": yes.min() if len(yes)>0 else pd.NaT,
+            "last_yes":  yes.max() if len(yes)>0 else pd.NaT,
+        })
+    out = df_pred.groupby("date", as_index=False).apply(agg)
+    out = out[out["any_yes"]==True].reset_index(drop=True)
+    return out
+
+# -----------------------------------------------------
+# CLI
+# -----------------------------------------------------
+
+def main():
+    cfg, models, sites, priors = load_pipeline()
+    sites_df, w15, m15 = load_dataframes()
+
+    mode = input("Mode? [dataset/ad-hoc]: ").strip().lower()
+    if mode not in ("dataset","ad-hoc"):
+        print("Invalid mode. Use 'dataset' or 'ad-hoc'.")
+        sys.exit(1)
+
+    site_id = input("Enter site_id (e.g., SITE_001): ").strip()
+    site_row = sites_df[sites_df["site_id"]==site_id]
+    if site_row.empty:
+        print("Unknown site_id. Please ensure your sites.csv contains this id.")
+        sys.exit(1)
+    site = site_row.iloc[0]
+
+    start_date = datetime.strptime(input("Start date (YYYY-MM-DD): ").strip(), "%Y-%m-%d")
+    end_date   = datetime.strptime(input("End date   (YYYY-MM-DD): ").strip(), "%Y-%m-%d")
+    end_date = end_date + timedelta(days=1) - timedelta(minutes=15)
+
+    phenotype_id = input("Phenotype (press Enter to auto-pick): ").strip()
+    if priors is not None:
+        if phenotype_id:
+            phen = priors[priors["phenotype_id"]==phenotype_id]
+            phen = phen.iloc[0] if not phen.empty else pick_phenotype(priors, site["litho_class_l2"])
+        else:
+            phen = pick_phenotype(priors, site["litho_class_l2"])
+    else:
+        phen = None
+
+    ad_hoc_cov = None
+    if mode == "ad-hoc":
+        print("\nEnter surface weather covariates (blank = default reasonable value):")
+        def askf(name, default):
+            s = input(f"{name} [{default}]: ").strip()
+            return float(s) if s else default
+        ad_hoc_cov = {}
+        ad_hoc_cov["t2m_C"]         = askf("t2m_C (°C)", float(site["annual_T_mean_C"]))
+        ad_hoc_cov["rh_%"]          = askf("rh_%", 65.0)
+        ad_hoc_cov["mslp_hPa"]      = askf("mslp_hPa", 1013.0)
+        ad_hoc_cov["wind_m_s"]      = askf("wind_m_s", 4.0)
+        ad_hoc_cov["wind_gust_m_s"] = askf("wind_gust_m_s", 6.0)
+        ad_hoc_cov["precip_mm"]     = askf("precip_mm (per 15 min)", 0.0)
+        ad_hoc_cov["cloud_frac"]    = askf("cloud_frac (0..1)", 0.5)
+        ad_hoc_cov["rad_MJ_m2"]     = askf("rad_MJ_m2", 0.6)
+        ad_hoc_cov["daylength_h"]   = askf("daylength_h", 12.0)
+
+        print("\nEnter microclimate non-target inputs (blank = defaults):")
+        ad_hoc_cov["RH_%"]               = askf("cave RH_%", 90.0)
+        ad_hoc_cov["P_mbar"]             = askf("cave P_mbar", 1013.0)
+        ad_hoc_cov["O2_%"]               = askf("cave O2_%", 20.5)
+        ad_hoc_cov["CH4_ppm"]            = askf("cave CH4_ppm", 1.0)
+        ad_hoc_cov["H2_ppm"]             = askf("cave H2_ppm", 0.3)
+        ad_hoc_cov["H2S_ppm"]            = askf("cave H2S_ppm", 0.02)
+        ad_hoc_cov["soil_moisture_%vol"] = askf("soil_moisture_%vol (0..1)", 0.35)
+        ad_hoc_cov["drip_rate_ml_min"]   = askf("drip_rate_ml_min", 0.5)
+
+    df_pred = predict_for_period(cfg, models, site, w15, m15, phen, start_date, end_date, mode=mode, ad_hoc_cov=ad_hoc_cov)
+
+    if df_pred.empty:
+        print("\nNo predictions produced (no timestamps in window or not enough history).")
+        sys.exit(0)
+
+    print("\n=== Sample predictions ===")
+    print(df_pred.head(8).to_string(index=False))
+
+    days_yes = summarize_viable_days(df_pred)
+    if days_yes.empty:
+        print("\nNo days with alien-life viability (YES) in the selected window.")
+    else:
+        print("\n=== Dates with ANY 'YES' ===")
+        for _, r in days_yes.iterrows():
+            d = r['date']
+            t0 = pd.to_datetime(r['first_yes']).strftime("%H:%M")
+            t1 = pd.to_datetime(r['last_yes']).strftime("%H:%M")
+            print(f"  {d}  (window ~ {t0} → {t1})")
+
+    out_name = f"predictions_{site_id}_{start_date.strftime('%Y%m%d')}_{(end_date).strftime('%Y%m%d')}.csv"
+    df_pred.to_csv(out_name, index=False)
+    print(f"\nSaved all predictions to: {out_name}")
+
+if __name__ == "__main__":
+    main()
