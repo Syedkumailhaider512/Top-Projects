@@ -30,7 +30,6 @@ This repository is designed to:
 - **Provide reusable examples** for students, researchers, and developers.  
 - **Document exploratory research** across different conceptual and scientific domains.
 
----
 
 ##  Technologies Used (Across Projects)
 
@@ -58,18 +57,17 @@ Project folders include their own specific requirements where necessary.
 
 ## Use Cases
 
-- You can use this repository to:
+You can use this repository to:
 - Learn how different AI and simulation methods work
 - Build your own projects on top of these
 - Study classical algorithms like ACO
 - Explore hypothetical biological/sci-fi inspired simulations
 - Understand my approach in AI Cadmey-style research projects
 
----
 
 ## Roadmap
 
-- Planned future improvements:
+Planned future improvements:
 - Add reinforcement learning examples
 - Create unified documentation for all projects
 - Add visual dashboards for simulations
@@ -84,7 +82,6 @@ Project folders include their own specific requirements where necessary.
 Licensed under the Apache-2.0 License.
 Feel free to use and modify with proper attribution.
 
----
 
 ## Author
 
